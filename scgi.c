@@ -7,16 +7,20 @@
 #include <search.h>
 
 
-int g_restart = 0;
-
 void die(const char *msg)
 {
 	perror(msg);
 	abort();
 }
 
-static int
-recv_fd(int sockfd)
+int restart = 0;				/* pending restart */
+
+static void hup_signal(int sig)
+{
+	restart = 1;
+}
+
+static int recv_fd(int sockfd)
 {
 	char tmp[CMSG_SPACE(sizeof(int))];
 	struct cmsghdr *cmsg;
@@ -38,8 +42,7 @@ recv_fd(int sockfd)
 	return *(int *) CMSG_DATA(cmsg);
 }
 
-static int
-send_fd(int sockfd, int fd)
+static int send_fd(int sockfd, int fd)
 {
 	char tmp[CMSG_SPACE(sizeof(int))];
 	struct cmsghdr *cmsg;
@@ -66,14 +69,6 @@ send_fd(int sockfd, int fd)
 	return 0;
 }
 
-
-struct child
-{
-	pid_t pid;
-	int fd;
-	int closed;
-};
-
 struct scgi_server
 {
 	unsigned short listen_port;
@@ -81,6 +76,14 @@ struct scgi_server
 	void *children;				/* binray tree of children */
 };
 
+struct child
+{
+	pid_t pid;
+	int fd;
+};
+
+fd_set children_fdset;
+int highest_fd;
 
 int child_cmp(const void *a, const void *b)
 {
@@ -93,21 +96,68 @@ int child_cmp(const void *a, const void *b)
 	return 0;
 }
 
-int append_child(void *root, pid_t pid, int fd)
+void add_child(void *root, pid_t pid, int fd)
 {
 	struct child *c = malloc(sizeof(struct child));
 	c->pid = pid;
 	c->fd = fd;
-	c->closed = 0;
 
-	tsearch(c, &root, child_cmp);
-	return 0;
+	void *val = tsearch((void *)c, &root, child_cmp);
+	if (val == NULL)
+		die("add child error");
+}
+
+void set_fd(const void *nodep, const VISIT which, const int depth)
+{
+	struct child *c;
+
+	switch (which) {
+	case postorder:
+	case leaf:
+		c = *(struct child **)nodep;
+		FD_SET(c->fd, &children_fdset);
+		if (c->fd > highest_fd)
+			highest_fd = c->fd;
+		break;
+	}
+}
+
+void fill_children_fdset(void *root)
+{
+	FD_ZERO(children_fdset);
+	highest_fd = -1;
+	twalk(root, set_fd);
+}
+
+struct *ready_child;
+
+void get_child(const void *nodep, const VISIT which, const int depth)
+{
+	struct child *c;
+
+	switch (which) {
+	case postorder:
+	case leaf:
+		c = *(struct child **)nodep;
+		if (FD_ISSET(c->fd, &children_fdset)) {
+			if (!ready_child)
+				ready_child = c;
+		}
+		break;
+	}
+}
+
+void get_ready_child(void *root)
+{
+	ready_child = NULL;
+	twalk(root, get_child);
 }
 
 int spawn_child(struct scgi_server *server, int conn)
 {
 	int flag = 1;
 	int fd[2];	/* parent, child */
+	
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) < 0) {
 		return -1;
 	}
@@ -128,7 +178,7 @@ int spawn_child(struct scgi_server *server, int conn)
 		exit(0);
 	} else if (pid > 0) {
 		close(fd[0]);
-		append_child(server->children, pid, fd[1]);
+		add_child(server->children, pid, fd[1]);
 	} else {
 		perror("fork failed");
 		return -1;
@@ -136,32 +186,17 @@ int spawn_child(struct scgi_server *server, int conn)
 	return 0;
 }
 
-static void hup_signal(int sig)
-{
-	g_restart = 1;
-}
-
-int fill_children_fdset(void *root, fd_set *fds)
-{
-	FD_ZERO(fds);
-
-	/* XXX */
-	return 0;
-}
-
 int delegate_request(struct scgi_server, int conn)
 {
-	fd_set fds;
-	int nfds, r;
+	int r;
 	struct timeval timeout;
-	struct child *child;
 
 	timeout.tv_usec = 0;
 	timeout.tv_sec = 0;
 
 	while (1) {
-		nfds = fill_children_fdset(scgi_server->children, &fds) + 1;
-		r = select(nfds, &fds, NULL, NULL, &timeout);
+		fill_children_fdset(scgi_server->children);
+		r = select(highest_fd + 1, &children_fdset, NULL, NULL, &timeout);
 		if (r < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -173,9 +208,11 @@ int delegate_request(struct scgi_server, int conn)
 			    Do the same walk order so that we keep preferring
 			    the same child.
 			*/
-			child = get_ready_child(scgi_server->children, &fds);
-			if (child == NULL) {
-				continue;	/* should never get here */
+			get_ready_child(scgi_server->children);
+			if (ready_child == NULL) {
+				/* should never get here */
+				fputs("Ooops\n", stderr);
+				continue;	
 			}
 
 			/*
@@ -187,7 +224,7 @@ int delegate_request(struct scgi_server, int conn)
 			  retry the select call.
 			*/
 
-			if (read(child->fd, buf, 1) != 1) {
+			if (read(ready_child->fd, buf, 1) != 1) {
 				if (errno == EAGAIN) {
 					;	/* pass */
 				} else {
@@ -203,7 +240,7 @@ int delegate_request(struct scgi_server, int conn)
 				  through to the "reap_children" logic and will
 				  retry the select call.
 				*/
-				if (send_fd(child->fd, conn) == -1) {
+				if (send_fd(ready_child->fd, conn) == -1) {
 					if (errno != EPIPE) {
 						die("sendfd error");
 					}
@@ -280,7 +317,7 @@ int serve(struct scgi_server *server)
 			perror("accept error");
 			return -1;
 		}
-		if (g_restart) {
+		if (restart) {
 			do_restart();
 		}
 	}

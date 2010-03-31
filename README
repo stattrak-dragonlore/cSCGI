@@ -1,1 +1,4 @@
-An Implementation of scgi server in c.
+
+I try to translate the Python code of scgi server[1] into C.
+
+ [1]. http://python.ca/scgi/
