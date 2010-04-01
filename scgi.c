@@ -68,6 +68,71 @@ static int send_fd(int sockfd, int fd)
 	return 0;
 }
 
+static int ns_read_size(int input)
+{
+	char str[64];
+	int i = 0;
+	char c;
+
+	while (1) {
+		if (read(input, &c, 1) <= 0)
+			return -1;
+		if (c == ':')
+			break;
+		else
+			str[i++] = c;
+	}
+	str[i] = '\0';
+
+	return atoi(str);
+}
+
+static void *ns_reads(int input, int *nbytes)
+{
+	int r, n = 0;
+	void *buf;
+	char t;
+	int size = ns_read_size(input);
+
+	if (size < 0)
+		die("bad header size");
+
+	buf = malloc(size);
+
+	while (size > 0) {
+		r = read(input, buf + n, size);
+		if (r <= 0)
+			die("bad header");
+		size -= r;
+		n += r;
+	}
+
+	if (read(input, &t, 1) <= 0 || t != ',')
+		die("missing ns terminator");
+
+	*nbytes = n;
+
+	return buf;
+}
+
+void read_env(int conn)
+{
+	int size;
+	void *name, *value;
+	void *headers = ns_reads(conn, &size);
+	void *str = headers;
+	void *end = headers + size;
+
+	while (str != end) {
+		name = str;
+		value = rawmemchr(str, '\0') + 1;
+		setenv((char *)name, (char *)value, 1);
+		str = rawmemchr(value, '\0') + 1;
+	}
+
+	free(headers);
+}
+
 void init_server(struct scgi_server *server, unsigned short port,
 		 int max_children, struct scgi_handler *handler)
 {
@@ -324,6 +389,7 @@ int serve_scgi(struct scgi_server *server)
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 
+	flag = 1;
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int)) < 0) {
 		perror("setsockopt error");
 		return -1;

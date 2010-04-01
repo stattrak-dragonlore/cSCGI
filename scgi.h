@@ -29,6 +29,8 @@ struct scgi_server {
 
 int recv_fd(int sockfd);
 
+void read_env(int conn);
+
 void init_server(struct scgi_server *server, unsigned short port,
 		 int max_children, struct scgi_handler *handler);
 
