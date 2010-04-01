@@ -2,3 +2,7 @@
 I try to translate the Python code of scgi server[1] into C.
 
  [1]. http://python.ca/scgi/
+
+
+ * demo
+ Run make to Build a demo server.
