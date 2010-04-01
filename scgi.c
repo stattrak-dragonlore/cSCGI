@@ -19,7 +19,7 @@ static void die(const char *msg)
 	abort();
 }
 
-int recv_fd(int sockfd)
+static int recv_fd(int sockfd)
 {
 	char tmp[CMSG_SPACE(sizeof(int))];
 	struct cmsghdr *cmsg;
@@ -126,15 +126,15 @@ void read_env(int conn)
 	while (str != end) {
 		name = str;
 		value = rawmemchr(str, '\0') + 1;
-		setenv((char *)name, (char *)value, 1);
+		setenv(name, value, 1);
 		str = rawmemchr(value, '\0') + 1;
 	}
 
 	free(headers);
 }
 
-void init_server(struct scgi_server *server, unsigned short port,
-		 int max_children, struct scgi_handler *handler)
+void init_scgi(struct scgi_server *server, unsigned short port,
+	       int max_children, struct scgi_handler *handler)
 {
 	server->listen_port = port;
 	server->max_children = max_children;
@@ -173,6 +173,7 @@ static void remove_child(struct children *children, struct child *child)
 		if ((c->next = c->next->next) == NULL)
 			children->last = &c->next;
 	}
+
 	children->size--;
 	free(child);
 }
@@ -219,6 +220,7 @@ static int spawn_child(struct scgi_server *server, int conn)
 {
 	int flag = 1;
 	int fd[2];	/* parent, child */
+	char magic = '1';
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) < 0) {
 		return -1;
@@ -231,17 +233,34 @@ static int spawn_child(struct scgi_server *server, int conn)
 	}
 
 	pid_t pid = fork();
+
 	if (pid == 0) {
+		close(fd[1]);
+
 		/* in the midst of handling a request,
 		   close the connection in the child
 		*/
 		if (conn)
 			close(conn);
 
-		close(fd[1]);
-		server->handler->parent_fd = fd[0];
-		server->handler->serve(server->handler);
+		if (server->handler->child_init_hook)
+			server->handler->child_init_hook();
+
+		/* serving connection */
+
+		while (1) {
+			if (write(fd[0], &magic, 1) < 0)
+				die("write magic byte error");
+
+			conn = recv_fd(fd[0]);
+			if (conn == -1)
+				die("recv_fd error");
+
+			server->handler->handle_connection(conn);
+		}
+
 		exit(0);
+
 	} else if (pid > 0) {
 		close(fd[0]);
 		add_child(&server->children, pid, fd[1]);
@@ -332,14 +351,10 @@ static int delegate_request(struct scgi_server *server, int conn)
 			  retry the select call.
 			*/
 
-			if (read(child->fd, &magic, 1) != 1) {
-				if (errno == EAGAIN) {
-					;	/* pass */
-				} else {
-					/* XXX: pass if child died */
-					die("read byte error");
-				}
-			} else {
+			r = read(child->fd, &magic, 1);
+			if (r == -1 && errno != EAGAIN) {
+				die("read byte error");
+			} else if (r == 1) {
 				assert(magic == '1');
 				/*
 				  The byte was read okay, now we need to pass the fd
@@ -348,10 +363,8 @@ static int delegate_request(struct scgi_server *server, int conn)
 				  through to the "reap_children" logic and will
 				  retry the select call.
 				*/
-				if (send_fd(child->fd, conn) == -1) {
-					if (errno != EPIPE) {
-						die("sendfd error");
-					}
+				if (send_fd(child->fd, conn) == -1 && errno != EPIPE) {
+					die("sendfd error");
 				} else {
 					/*
 					  fd was apparently passed okay to the child.

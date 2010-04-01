@@ -7,6 +7,7 @@ struct child {
 	struct child *next;
 };
 
+/* see FreeBSD's STAILQ */
 struct children {
 	struct child *first;
 	struct child **last;			/* addr of last next element */
@@ -14,8 +15,7 @@ struct children {
 };
 
 struct scgi_handler {
-	int parent_fd;
-	void (*serve)(struct scgi_handler *this);
+	void (*child_init_hook)();
 	void (*handle_connection)(int conn);
 };
 
@@ -27,11 +27,9 @@ struct scgi_server {
 };
 
 
-int recv_fd(int sockfd);
-
 void read_env(int conn);
 
-void init_server(struct scgi_server *server, unsigned short port,
+void init_scgi(struct scgi_server *server, unsigned short port,
 		 int max_children, struct scgi_handler *handler);
 
 int serve_scgi(struct scgi_server *server);
