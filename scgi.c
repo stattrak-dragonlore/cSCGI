@@ -1,26 +1,25 @@
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <search.h>
+#include <assert.h>
+#include "scgi.h"
 
 
-void die(const char *msg)
+static void die(const char *msg)
 {
 	perror(msg);
 	abort();
 }
 
-int restart = 0;				/* pending restart */
-
-static void hup_signal(int sig)
-{
-	restart = 1;
-}
-
-static int recv_fd(int sockfd)
+int recv_fd(int sockfd)
 {
 	char tmp[CMSG_SPACE(sizeof(int))];
 	struct cmsghdr *cmsg;
@@ -39,7 +38,7 @@ static int recv_fd(int sockfd)
 	if (recvmsg(sockfd, &msg, 0) <= 0)
 		return -1;
 	cmsg = CMSG_FIRSTHDR(&msg);
-	return *(int *) CMSG_DATA(cmsg);
+	return *(int *)CMSG_DATA(cmsg);
 }
 
 static int send_fd(int sockfd, int fd)
@@ -69,95 +68,93 @@ static int send_fd(int sockfd, int fd)
 	return 0;
 }
 
-struct scgi_server
+void init_server(struct scgi_server *server, unsigned short port,
+		 int max_children, struct scgi_handler *handler)
 {
-	unsigned short listen_port;
-	int max_children;
-	void *children;				/* binray tree of children */
-};
+	server->listen_port = port;
+	server->max_children = max_children;
 
-struct child
-{
-	pid_t pid;
-	int fd;
-};
+	server->children.first = NULL;
+	server->children.last = &server->children.first;
+	server->children.size = 0;
 
-fd_set children_fdset;
-int highest_fd;
-
-int child_cmp(const void *a, const void *b)
-{
-	struct child *ca = (struct child *)a;
-	struct child *ba = (struct child *)b;
-	if (ca->pid < cb->pid)
-		return -1;
-	else if (ca->pid > cb->pid)
-		return 1;
-	return 0;
+	server->handler = handler;
 }
 
-void add_child(void *root, pid_t pid, int fd)
+static void add_child(struct children *children, pid_t pid, int fd)
 {
-	struct child *c = malloc(sizeof(struct child));
+	struct child *c = (struct child *)malloc(sizeof(struct child));
 	c->pid = pid;
 	c->fd = fd;
+	c->next = NULL;
 
-	void *val = tsearch((void *)c, &root, child_cmp);
-	if (val == NULL)
-		die("add child error");
+	*(children->last) = c;
+	children->last = &(c->next);
+	children->size++;
 }
 
-void set_fd(const void *nodep, const VISIT which, const int depth)
+static void remove_child(struct children *children, struct child *child)
 {
 	struct child *c;
 
-	switch (which) {
-	case postorder:
-	case leaf:
-		c = *(struct child **)nodep;
-		FD_SET(c->fd, &children_fdset);
+	if (children->first == child) {
+		if ((children->first = children->first->next) == NULL)
+			children->last = &children->first;
+	} else {
+		c = children->first;
+		while (c->next != child)
+			c = c->next;
+
+		if ((c->next = c->next->next) == NULL)
+			children->last = &c->next;
+	}
+	children->size--;
+	free(child);
+}
+
+static int fill_children_fdset(struct children *children, fd_set *fds)
+{
+	struct child *c;
+	int highest_fd = -1;
+
+	FD_ZERO(fds);
+
+	for (c = children->first; c; c = c->next) {
+		FD_SET(c->fd, fds);
 		if (c->fd > highest_fd)
 			highest_fd = c->fd;
-		break;
 	}
+
+	return highest_fd;
 }
 
-void fill_children_fdset(void *root)
+static struct child *get_ready_child(struct children *children, fd_set *fds)
 {
-	FD_ZERO(children_fdset);
-	highest_fd = -1;
-	twalk(root, set_fd);
+	struct child *c = NULL;
+
+	for (c = children->first; c; c = c->next)
+		if (FD_ISSET(c->fd, fds))
+			break;
+
+	return c;
 }
 
-struct *ready_child;
-
-void get_child(const void *nodep, const VISIT which, const int depth)
+static struct child *get_child(struct children *children, pid_t pid)
 {
-	struct child *c;
+	struct child *c = NULL;
 
-	switch (which) {
-	case postorder:
-	case leaf:
-		c = *(struct child **)nodep;
-		if (FD_ISSET(c->fd, &children_fdset)) {
-			if (!ready_child)
-				ready_child = c;
-		}
-		break;
-	}
+	for (c = children->first; c; c = c->next)
+		if (c->pid == pid)
+			break;
+
+	return c;
 }
 
-void get_ready_child(void *root)
-{
-	ready_child = NULL;
-	twalk(root, get_child);
-}
-
-int spawn_child(struct scgi_server *server, int conn)
+static int spawn_child(struct scgi_server *server, int conn)
 {
 	int flag = 1;
 	int fd[2];	/* parent, child */
-	
+
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) < 0) {
 		return -1;
 	}
@@ -170,15 +167,19 @@ int spawn_child(struct scgi_server *server, int conn)
 
 	pid_t pid = fork();
 	if (pid == 0) {
+		/* in the midst of handling a request,
+		   close the connection in the child
+		*/
 		if (conn)
 			close(conn);
 
-		close(fd[0]);
-		handler_serve(fd[0]);
+		close(fd[1]);
+		server->handler->parent_fd = fd[0];
+		server->handler->serve(server->handler);
 		exit(0);
 	} else if (pid > 0) {
 		close(fd[0]);
-		add_child(server->children, pid, fd[1]);
+		add_child(&server->children, pid, fd[1]);
 	} else {
 		perror("fork failed");
 		return -1;
@@ -186,17 +187,59 @@ int spawn_child(struct scgi_server *server, int conn)
 	return 0;
 }
 
-int delegate_request(struct scgi_server, int conn)
+static void reap_children(struct scgi_server *server)
 {
-	int r;
+	pid_t pid;
+	struct child *child;
+
+	while (server->children.size) {
+		pid = waitpid(-1, NULL, WNOHANG);
+		if (pid <= 0)
+			break;
+
+		child = get_child(&server->children, pid);
+		close(child->fd);
+		remove_child(&server->children, child);
+	}
+}
+
+int restart = 0;				/* pending restart */
+
+static void hup_signal(int sig)
+{
+	restart = 1;
+}
+
+static void do_stop(struct scgi_server *server)
+{
+	struct child *c;
+
+	/* Close connections to the children, which will cause them to exit
+	   after finishing what they are doing.	*/
+	for (c = server->children.first; c; c = c->next)
+		close(c->fd);
+}
+
+static void do_restart(struct scgi_server *server)
+{
+	do_stop(server);
+	restart = 0;
+}
+
+static int delegate_request(struct scgi_server *server, int conn)
+{
+	fd_set fds;
+	int highest_fd, r;
+	struct child *child;
 	struct timeval timeout;
+	char magic;
 
 	timeout.tv_usec = 0;
 	timeout.tv_sec = 0;
 
 	while (1) {
-		fill_children_fdset(scgi_server->children);
-		r = select(highest_fd + 1, &children_fdset, NULL, NULL, &timeout);
+		highest_fd = fill_children_fdset(&server->children, &fds);
+		r = select(highest_fd + 1, &fds, NULL, NULL, &timeout);
 		if (r < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -208,11 +251,11 @@ int delegate_request(struct scgi_server, int conn)
 			    Do the same walk order so that we keep preferring
 			    the same child.
 			*/
-			get_ready_child(scgi_server->children);
-			if (ready_child == NULL) {
+			child = get_ready_child(&server->children, &fds);
+			if (child == NULL) {
 				/* should never get here */
 				fputs("Ooops\n", stderr);
-				continue;	
+				continue;
 			}
 
 			/*
@@ -224,7 +267,7 @@ int delegate_request(struct scgi_server, int conn)
 			  retry the select call.
 			*/
 
-			if (read(ready_child->fd, buf, 1) != 1) {
+			if (read(child->fd, &magic, 1) != 1) {
 				if (errno == EAGAIN) {
 					;	/* pass */
 				} else {
@@ -232,7 +275,7 @@ int delegate_request(struct scgi_server, int conn)
 					die("read byte error");
 				}
 			} else {
-				assert(buf[0] == '1');
+				assert(magic == '1');
 				/*
 				  The byte was read okay, now we need to pass the fd
 				  of the request to the child.  This can also fail
@@ -240,7 +283,7 @@ int delegate_request(struct scgi_server, int conn)
 				  through to the "reap_children" logic and will
 				  retry the select call.
 				*/
-				if (send_fd(ready_child->fd, conn) == -1) {
+				if (send_fd(child->fd, conn) == -1) {
 					if (errno != EPIPE) {
 						die("sendfd error");
 					}
@@ -259,8 +302,8 @@ int delegate_request(struct scgi_server, int conn)
 		reap_children(server);
 
 		/* start more children if we haven't met max_children limit */
-		if (len(server->children) < server->max_children)
-			spawn_child(server);
+		if (server->children.size < server->max_children)
+			spawn_child(server, conn);
 
 		/* Start blocking inside select.  We might have reached
 		   max_children limit and they are all busy.
@@ -272,16 +315,11 @@ int delegate_request(struct scgi_server, int conn)
 	return 0;
 }
 
-int do_restart()
-{
-	return 0;
-}
-
-int serve(struct scgi_server *server)
+int serve_scgi(struct scgi_server *server)
 {
 	int flag, sock, conn;
 	struct sockaddr_in bindaddr;
-	struct sockaddr *cliaddr;
+	struct sockaddr_in cliaddr;
 	socklen_t addrlen = sizeof(cliaddr);
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -309,7 +347,7 @@ int serve(struct scgi_server *server)
 	signal(SIGHUP, hup_signal);
 
 	while (1) {
-		conn = accept(sock, cliaddr, &addrlen);
+		conn = accept(sock, &cliaddr, &addrlen);
 		if (conn != -1) {
 			delegate_request(server, conn);
 			close(conn);
@@ -318,23 +356,9 @@ int serve(struct scgi_server *server)
 			return -1;
 		}
 		if (restart) {
-			do_restart();
+			do_restart(server);
 		}
 	}
 	return 0;
 }
 
-
-#define DEFAULT_PORT = 7777
-#define MAX_CHILDREN = 10
-
-int main(int argc, char *argv[])
-{
-	struct scgi_server;
-	scgi_server.listen_port = DEFAULT_PORT;
-	scgi_server.max_children = MAX_CHILDREN;
-	scgi_server.children = NULL;
-
-	serve(&scgi_server);
-    	return 0;
-}
