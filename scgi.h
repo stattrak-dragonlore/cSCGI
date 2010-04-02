@@ -4,6 +4,7 @@
 struct child {
 	pid_t pid;
 	int fd;
+	int closed;
 	struct child *next;
 };
 

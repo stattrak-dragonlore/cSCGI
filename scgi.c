@@ -133,24 +133,12 @@ void read_env(int conn)
 	free(headers);
 }
 
-void init_scgi(struct scgi_server *server, unsigned short port,
-	       int max_children, struct scgi_handler *handler)
-{
-	server->listen_port = port;
-	server->max_children = max_children;
-
-	server->children.first = NULL;
-	server->children.last = &server->children.first;
-	server->children.size = 0;
-
-	server->handler = handler;
-}
-
 static void add_child(struct children *children, pid_t pid, int fd)
 {
 	struct child *c = malloc(sizeof(struct child));
 	c->pid = pid;
 	c->fd = fd;
+	c->closed = 0;
 	c->next = NULL;
 
 	*(children->last) = c;
@@ -186,9 +174,11 @@ static int fill_children_fdset(struct children *children, fd_set *fds)
 	FD_ZERO(fds);
 
 	for (c = children->first; c; c = c->next) {
-		FD_SET(c->fd, fds);
-		if (c->fd > highest_fd)
-			highest_fd = c->fd;
+		if (!c->closed) {
+			FD_SET(c->fd, fds);
+			if (c->fd > highest_fd)
+				highest_fd = c->fd;
+		}
 	}
 
 	return highest_fd;
@@ -199,7 +189,7 @@ static struct child *get_ready_child(struct children *children, fd_set *fds)
 	struct child *c = NULL;
 
 	for (c = children->first; c; c = c->next)
-		if (FD_ISSET(c->fd, fds))
+		if (!c->closed && FD_ISSET(c->fd, fds))
 			break;
 
 	return c;
@@ -240,7 +230,7 @@ static int spawn_child(struct scgi_server *server, int conn)
 		/* in the midst of handling a request,
 		   close the connection in the child
 		*/
-		if (conn)
+		if (conn != -1)
 			close(conn);
 
 		if (server->handler->child_init_hook)
@@ -282,7 +272,8 @@ static void reap_children(struct scgi_server *server)
 			break;
 
 		child = get_child(&server->children, pid);
-		close(child->fd);
+		if (!child->closed)
+			close(child->fd);
 		remove_child(&server->children, child);
 	}
 }
@@ -300,8 +291,12 @@ static void do_stop(struct scgi_server *server)
 
 	/* Close connections to the children, which will cause them to exit
 	   after finishing what they are doing.	*/
-	for (c = server->children.first; c; c = c->next)
-		close(c->fd);
+	for (c = server->children.first; c; c = c->next) {
+		if (!c->closed) {
+			close(c->fd);
+			c->closed = 1;
+		}
+	}
 }
 
 static void do_restart(struct scgi_server *server)
@@ -393,6 +388,21 @@ static int delegate_request(struct scgi_server *server, int conn)
 	return 0;
 }
 
+void init_scgi(struct scgi_server *server, unsigned short port,
+	       int max_children, struct scgi_handler *handler)
+{
+	server->listen_port = port;
+	server->max_children = max_children;
+
+	server->children.first = NULL;
+	server->children.last = &server->children.first;
+	server->children.size = 0;
+
+	server->handler = handler;
+
+	spawn_child(server, -1);
+}
+
 int serve_scgi(struct scgi_server *server)
 {
 	int flag, sock, conn;
@@ -423,7 +433,9 @@ int serve_scgi(struct scgi_server *server)
 		return -1;
 	}
 
+
 	signal(SIGHUP, hup_signal);
+	siginterrupt(SIGHUP, 1);
 
 	while (1) {
 		conn = accept(sock, &cliaddr, &addrlen);
@@ -434,6 +446,7 @@ int serve_scgi(struct scgi_server *server)
 			perror("accept error");
 			return -1;
 		}
+
 		if (restart) {
 			do_restart(server);
 		}
