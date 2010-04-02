@@ -13,8 +13,8 @@
   2. Define your own connection handler [and child initialization hook].
 
    struct scgi_handler handler = {
-	.child_init_hook = NULL,
-	.handle_connection = handle_connection,
+   	  .child_init_hook = NULL,
+	  .handle_connection = handle_connection,
    };
 
    child_init_hook() is where you can do some initialization work before
