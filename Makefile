@@ -1,4 +1,4 @@
-CFLAGS = -Wall -Werror -g -D_GNU_SOURCE
+CFLAGS = -Wall -Werror -g -O2 -D_GNU_SOURCE
 
 ALL:	demo_server
 

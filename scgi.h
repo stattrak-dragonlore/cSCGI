@@ -30,7 +30,7 @@ struct scgi_server {
 void read_env(int conn);
 
 void init_scgi(struct scgi_server *server, unsigned short port,
-		 int max_children, struct scgi_handler *handler);
+	       int max_children, struct scgi_handler *handler);
 
 int serve_scgi(struct scgi_server *server);
 

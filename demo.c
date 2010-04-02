@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include "scgi.h"
 
 #define DEFAULT_PORT  4000
@@ -15,17 +14,17 @@ void handle_connection(int conn)
 	char header[] ="Content-Length: 7\r\n";
 	char end[] = "\r\n";
 	char body[] = "fuckgfw";
-	
+
 	/* read headers into environment */
 	read_env(conn);
-	
+
 	fprintf(stderr, "%s %s %s\n",
 		getenv("REMOTE_ADDR"),
 		getenv("REQUEST_METHOD"),
 		getenv("REQUEST_URI"));
-	
+
 	int r;
-	
+
 	r = write(conn, status, strlen(status));
 	r = write(conn, header, strlen(header));
 	r = write(conn, end, 2);

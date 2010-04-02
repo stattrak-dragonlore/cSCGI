@@ -148,7 +148,7 @@ void init_scgi(struct scgi_server *server, unsigned short port,
 
 static void add_child(struct children *children, pid_t pid, int fd)
 {
-	struct child *c = (struct child *)malloc(sizeof(struct child));
+	struct child *c = malloc(sizeof(struct child));
 	c->pid = pid;
 	c->fd = fd;
 	c->next = NULL;

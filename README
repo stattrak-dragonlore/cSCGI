@@ -1,8 +1,44 @@
+* What's it?
+  A scgi server written in C, mostly translated from the Python
+  scgi server (http://python.ca/scgi/)
 
-I try to translate the Python code of scgi server[1] into C.
+* How to use it?
 
- [1]. http://python.ca/scgi/
+  1. Include these 2 headers:
+
+     #include <unistd.h>
+     #include "scgi.h"
 
 
- * demo
- Run make to Build a demo server.
+  2. Define your own connection handler [and child initialization hook].
+
+   struct scgi_handler handler = {
+	.child_init_hook = NULL,
+	.handle_connection = handle_connection,
+   };
+
+   child_init_hook() is where you can do some initialization work before
+   handling connections, leave it NULL if nothing to do.
+
+   handle_connection(int conn) is called when a new connection has been
+   established. You should define this handler function.
+
+
+  3. Declare a scgi_server and initialize it with:
+
+   void init_scgi(struct scgi_server *server, unsigned short port,
+   	          int max_children, struct scgi_handler *handler)
+
+
+  4. Call int serve_scgi(struct scgi_server *server) to serve forever.
+
+     That's all, read demo.c for a complete example.
+
+      $ make
+      $ ./demo_server
+
+     A scgi server is serving on DEFAULT_PORT(4000)...
+
+
+
+
